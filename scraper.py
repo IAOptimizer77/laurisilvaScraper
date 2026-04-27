@@ -22,7 +22,7 @@ OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
 EMBEDDING_MODEL   = "text-embedding-3-small"
 EMBEDDING_DIM     = 1536
 BATCH_SIZE        = 50
-SCRAPE_DELAY      = 0.5  # segundos entre requests
+SCRAPE_DELAY      = float(os.getenv("SCRAPE_DELAY", "1.5"))  # segundos entre requests
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("scraper")
@@ -268,8 +268,20 @@ def run_pipeline(tienda: str):
 
     session = requests.Session()
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (compatible; HerbolarioBot/1.0)",
-        "Accept-Language": "es-ES,es;q=0.9",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
     })
 
     tasks = []
@@ -278,7 +290,21 @@ def run_pipeline(tienda: str):
     if tienda in ("laurisilva", "all"):
         tasks.append(("laurisilva_productos", get_product_urls_laurisilva, scrape_laurisilva))
 
+    # Warm-up: visitar home de cada tienda antes de scrapear productos
+    warmup_urls = {
+        "ventana_natural_productos": "https://laventananatural.com/",
+        "laurisilva_productos":      "https://www.laurisilvabio.com/",
+    }
+
     for collection_name, get_urls_fn, scrape_fn in tasks:
+        try:
+            warmup = warmup_urls.get(collection_name, "")
+            if warmup:
+                session.get(warmup, timeout=10)
+                time.sleep(2)
+        except Exception:
+            pass
+
         ensure_collection(qdrant, collection_name)
         urls = get_urls_fn(session)
         logger.info(f"Procesando {len(urls)} URLs para {collection_name}")
