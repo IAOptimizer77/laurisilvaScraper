@@ -116,8 +116,18 @@ def get_product_urls_ventana_natural() -> list[str]:
     return products
 
 
-async def get_product_urls_laurisilva() -> list[str]:
-    """Fetch laurisilva sitemaps via Playwright stealth — Cloudflare blocks plain requests."""
+def get_product_urls_laurisilva(qdrant_client: QdrantClient = None) -> list[str]:
+    """
+    Returns product URLs for laurisilva scraping.
+    Primary source: existing Qdrant collection (avoids Cloudflare-blocked sitemaps).
+    Fallback: sitemap via requests (works only from non-datacenter IPs).
+    """
+    if qdrant_client is not None:
+        urls = _get_urls_from_qdrant(qdrant_client, "laurisilva_productos")
+        if urls:
+            return urls
+
+    # Fallback: sitemaps (blocked from Easypanel/datacenter IPs)
     sitemaps = [
         "https://www.laurisilvabio.com/product_sitemap_0.xml",
         "https://www.laurisilvabio.com/product_sitemap_1000.xml",
@@ -125,38 +135,32 @@ async def get_product_urls_laurisilva() -> list[str]:
         "https://www.laurisilvabio.com/product_sitemap_3000.xml",
     ]
     all_urls = []
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True, args=BROWSER_ARGS)
-        context = await browser.new_context(
-            locale="es-ES",
-            timezone_id="Atlantic/Canary",
-            viewport={"width": 1280, "height": 800},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        )
-        for sm_url in sitemaps:
-            page = await context.new_page()
-            try:
-                await stealth_async(page)
-                resp = await page.goto(sm_url, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
-                if resp and resp.ok:
-                    body = await resp.body()
-                    if body[:1] == b"<":
-                        root = ET.fromstring(body)
-                        urls = [loc.text.strip() for loc in root.findall(".//sm:loc", SITEMAP_NS) if loc.text]
-                        all_urls.extend(urls)
-                        logger.info(f"Sitemap {sm_url} → {len(urls)} URLs")
-                    else:
-                        logger.error(f"Sitemap {sm_url} devolvió non-XML. Primeros bytes: {body[:200]}")
-                else:
-                    status = resp.status if resp else "no response"
-                    logger.error(f"Sitemap {sm_url} → HTTP {status}")
-            except Exception as e:
-                logger.error(f"Error leyendo sitemap {sm_url}: {e}")
-            finally:
-                await page.close()
-        await browser.close()
-    logger.info(f"LauriSilvaBio — {len(all_urls)} productos")
+    for sm in sitemaps:
+        all_urls.extend(get_urls_from_sitemap(sm))
+    logger.info(f"LauriSilvaBio — {len(all_urls)} productos (desde sitemap)")
     return all_urls
+
+
+def _get_urls_from_qdrant(client: QdrantClient, collection: str) -> list[str]:
+    """Scroll all points and extract URL from payload."""
+    urls = []
+    offset = None
+    while True:
+        points, offset = client.scroll(
+            collection_name=collection,
+            limit=1000,
+            offset=offset,
+            with_payload=["URL"],
+            with_vectors=False,
+        )
+        for p in points:
+            url = p.payload.get("URL") or p.payload.get("metadata", {}).get("URL")
+            if url:
+                urls.append(url)
+        if offset is None:
+            break
+    logger.info(f"[{collection}] {len(urls)} URLs extraídas de Qdrant")
+    return urls
 
 # ============================================================
 # Parsers HTML (reciben el HTML ya renderizado por Playwright)
@@ -372,16 +376,13 @@ async def run_pipeline_async(tienda: str):
 
     tasks = []
     if tienda in ("ventana_natural", "all"):
-        tasks.append(("ventana_natural_productos", get_product_urls_ventana_natural, parse_ventana_natural))
+        tasks.append(("ventana_natural_productos", lambda: get_product_urls_ventana_natural(), parse_ventana_natural))
     if tienda in ("laurisilva", "all"):
-        tasks.append(("laurisilva_productos", get_product_urls_laurisilva, parse_laurisilva))
+        tasks.append(("laurisilva_productos", lambda: get_product_urls_laurisilva(qdrant), parse_laurisilva))
 
     for collection_name, get_urls_fn, parser_fn in tasks:
         ensure_collection(qdrant, collection_name)
-        if asyncio.iscoroutinefunction(get_urls_fn):
-            urls = await get_urls_fn()
-        else:
-            urls = get_urls_fn()
+        urls = get_urls_fn()
         logger.info(f"Procesando {len(urls)} URLs para {collection_name}")
         await scrape_urls_with_playwright(urls, parser_fn, collection_name, qdrant, openai_client)
 
