@@ -1,0 +1,50 @@
+name: Test Cloudflare from GitHub Actions
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show runner IP
+        run: |
+          echo "Public IP:"
+          curl -s https://api.ipify.org
+          echo ""
+
+      - name: Test laurisilvabio.com endpoints
+        run: |
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+          echo "=== Test 1: producto individual ==="
+          curl -s -o /dev/null -w "HTTP %{http_code} | size: %{size_download}\n" \
+            -H "User-Agent: $UA" \
+            "https://www.laurisilvabio.com/respiwow-perros-soria-natural-p8422947076016"
+
+          echo "=== Test 2: categoría /herbolario ==="
+          curl -s -o /dev/null -w "HTTP %{http_code} | size: %{size_download}\n" \
+            -H "User-Agent: $UA" \
+            "https://www.laurisilvabio.com/herbolario"
+
+          echo "=== Test 3: categoría paginada /herbolario-p5 ==="
+          curl -s -o /dev/null -w "HTTP %{http_code} | size: %{size_download}\n" \
+            -H "User-Agent: $UA" \
+            "https://www.laurisilvabio.com/herbolario-p5"
+
+          echo "=== Test 4: home ==="
+          curl -s -o /dev/null -w "HTTP %{http_code} | size: %{size_download}\n" \
+            -H "User-Agent: $UA" \
+            "https://www.laurisilvabio.com/"
+
+          echo "=== Test 5: sitemap ==="
+          curl -s -o /dev/null -w "HTTP %{http_code} | size: %{size_download}\n" \
+            -H "User-Agent: $UA" \
+            "https://www.laurisilvabio.com/product_sitemap_0.xml"
+
+          echo "=== Test 6: AJAX remote_request.php ==="
+          curl -s -o /dev/null -w "HTTP %{http_code} | size: %{size_download}\n" \
+            -X POST "https://www.laurisilvabio.com/remote_request.php" \
+            -H "Content-Type: application/json" \
+            -H "User-Agent: $UA" \
+            -d '{}'
