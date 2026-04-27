@@ -51,13 +51,23 @@ class Producto:
     def texto_para_embedding(self) -> str:
         return f"{self.nombre} {self.marca} {self.categoria} {self.formato} {self.descripcion}"
 
-    def uid(self) -> str:
-        return hashlib.md5(self.url.encode()).hexdigest()
+    def uid(self) -> int:
+        return int(hashlib.md5(self.url.encode()).hexdigest(), 16) % (2**63)
+
+    def content_hash(self) -> str:
+        raw = f"{self.nombre}|{self.precio}|{self.marca}|{self.descripcion}"
+        return hashlib.md5(raw.encode()).hexdigest()
+
+    def precio_float(self) -> float:
+        try:
+            return float(self.precio.replace("€", "").replace(",", ".").strip())
+        except Exception:
+            return 0.0
 
     def payload(self) -> dict:
         return {
             "NombreProducto":      self.nombre,
-            "Precio":              self.precio,
+            "Precio":              self.precio_float(),
             "Marca":               self.marca,
             "InformacionProducto": self.descripcion,
             "Categoria":           self.categoria,
@@ -65,6 +75,7 @@ class Producto:
             "SKU":                 self.sku,
             "URL":                 self.url,
             "Tienda":              self.tienda,
+            "content_hash":        self.content_hash(),
         }
 
 # ============================================================
@@ -212,6 +223,28 @@ def parse_laurisilva(html: str, url: str) -> Optional[Producto]:
 # Qdrant
 # ============================================================
 
+def fetch_existing_hashes(client: QdrantClient, collection: str) -> dict[int, str]:
+    """Carga {point_id: content_hash} de todos los puntos existentes en una pasada."""
+    hashes: dict[int, str] = {}
+    offset = None
+    while True:
+        points, offset = client.scroll(
+            collection_name=collection,
+            limit=1000,
+            offset=offset,
+            with_payload=["content_hash"],
+            with_vectors=False,
+        )
+        for p in points:
+            h = p.payload.get("content_hash")
+            if h:
+                hashes[p.id] = h
+        if offset is None:
+            break
+    logger.info(f"[{collection}] {len(hashes)} hashes cargados de Qdrant")
+    return hashes
+
+
 def ensure_collection(client: QdrantClient, name: str):
     existing = [c.name for c in client.get_collections().collections]
     if name not in existing:
@@ -229,7 +262,7 @@ def upsert_batch(client: QdrantClient, collection: str, productos: list[Producto
     resp = openai.embeddings.create(input=texts, model=EMBEDDING_MODEL)
     vectors = [e.embedding for e in resp.data]
     points = [
-        PointStruct(id=int(p.uid(), 16) % (2**63), vector=v, payload=p.payload())
+        PointStruct(id=p.uid(), vector=v, payload=p.payload())
         for p, v in zip(productos, vectors)
     ]
     result = client.upsert(collection_name=collection, points=points)
@@ -254,7 +287,8 @@ async def scrape_urls_with_playwright(
     qdrant: QdrantClient,
     openai_client: OpenAI,
 ):
-    ok = err = 0
+    existing_hashes = fetch_existing_hashes(qdrant, collection_name)
+    ok = skipped = err = 0
     batch: list[Producto] = []
 
     async with async_playwright() as pw:
@@ -273,9 +307,13 @@ async def scrape_urls_with_playwright(
                 await page.goto(url, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
                 html = await page.content()
                 producto = parser_fn(html, url)
+
                 if producto:
-                    batch.append(producto)
-                    ok += 1
+                    if existing_hashes.get(producto.uid()) == producto.content_hash():
+                        skipped += 1
+                    else:
+                        batch.append(producto)
+                        ok += 1
                 else:
                     err += 1
             except Exception as e:
@@ -286,7 +324,7 @@ async def scrape_urls_with_playwright(
 
             if len(batch) >= BATCH_SIZE:
                 upsert_batch(qdrant, collection_name, batch, openai_client)
-                logger.info(f"[{collection_name}] Upserted {ok} / {i+1} procesados, {err} errores")
+                logger.info(f"[{collection_name}] Upserted {ok} | Skipped {skipped} | Err {err} | Total {i+1}/{len(urls)}")
                 batch = []
 
             await asyncio.sleep(SCRAPE_DELAY)
@@ -296,7 +334,7 @@ async def scrape_urls_with_playwright(
     if batch:
         upsert_batch(qdrant, collection_name, batch, openai_client)
 
-    logger.info(f"[{collection_name}] COMPLETO — {ok} indexados, {err} errores")
+    logger.info(f"[{collection_name}] COMPLETO — {ok} actualizados, {skipped} sin cambios, {err} errores")
 
 
 async def run_pipeline_async(tienda: str):
