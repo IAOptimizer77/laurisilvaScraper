@@ -116,7 +116,8 @@ def get_product_urls_ventana_natural() -> list[str]:
     return products
 
 
-def get_product_urls_laurisilva() -> list[str]:
+async def get_product_urls_laurisilva() -> list[str]:
+    """Fetch laurisilva sitemaps via Playwright stealth — Cloudflare blocks plain requests."""
     sitemaps = [
         "https://www.laurisilvabio.com/product_sitemap_0.xml",
         "https://www.laurisilvabio.com/product_sitemap_1000.xml",
@@ -124,8 +125,36 @@ def get_product_urls_laurisilva() -> list[str]:
         "https://www.laurisilvabio.com/product_sitemap_3000.xml",
     ]
     all_urls = []
-    for sm in sitemaps:
-        all_urls.extend(get_urls_from_sitemap(sm))
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True, args=BROWSER_ARGS)
+        context = await browser.new_context(
+            locale="es-ES",
+            timezone_id="Atlantic/Canary",
+            viewport={"width": 1280, "height": 800},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        )
+        for sm_url in sitemaps:
+            page = await context.new_page()
+            try:
+                await stealth_async(page)
+                resp = await page.goto(sm_url, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
+                if resp and resp.ok:
+                    body = await resp.body()
+                    if body[:1] == b"<":
+                        root = ET.fromstring(body)
+                        urls = [loc.text.strip() for loc in root.findall(".//sm:loc", SITEMAP_NS) if loc.text]
+                        all_urls.extend(urls)
+                        logger.info(f"Sitemap {sm_url} → {len(urls)} URLs")
+                    else:
+                        logger.error(f"Sitemap {sm_url} devolvió non-XML. Primeros bytes: {body[:200]}")
+                else:
+                    status = resp.status if resp else "no response"
+                    logger.error(f"Sitemap {sm_url} → HTTP {status}")
+            except Exception as e:
+                logger.error(f"Error leyendo sitemap {sm_url}: {e}")
+            finally:
+                await page.close()
+        await browser.close()
     logger.info(f"LauriSilvaBio — {len(all_urls)} productos")
     return all_urls
 
@@ -349,7 +378,10 @@ async def run_pipeline_async(tienda: str):
 
     for collection_name, get_urls_fn, parser_fn in tasks:
         ensure_collection(qdrant, collection_name)
-        urls = get_urls_fn()
+        if asyncio.iscoroutinefunction(get_urls_fn):
+            urls = await get_urls_fn()
+        else:
+            urls = get_urls_fn()
         logger.info(f"Procesando {len(urls)} URLs para {collection_name}")
         await scrape_urls_with_playwright(urls, parser_fn, collection_name, qdrant, openai_client)
 
