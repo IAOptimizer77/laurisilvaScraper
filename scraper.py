@@ -1,13 +1,16 @@
 import asyncio
+import base64
 import hashlib
 import json as _json
 import logging
 import os
+import re
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Optional
 
+import phpserialize
 import requests
 from bs4 import BeautifulSoup
 from openai import OpenAI
@@ -114,6 +117,200 @@ def get_product_urls_ventana_natural() -> list[str]:
     products = [u for u in all_urls if pattern.search(u)]
     logger.info(f"La Ventana Natural — {len(products)} productos")
     return products
+
+
+# ============================================================
+# LauriSilvaBio — scraping por páginas de categoría (Arminet)
+# ============================================================
+# Cada página de categoría devuelve 20 productos con datos completos
+# embebidos en widget `lista_deseos-XXXXX` data-configuration (base64
+# → PHP serialize → objeto Articulo). Funciona desde IP datacenter,
+# Cloudflare no bloquea categorías. Ver auditoria/INVESTIGACION_LAURISILVA_SCRAPER.md
+
+LAURISILVA_CATEGORIAS = [
+    "herbolario",
+    "dieta",
+    "cosmetica-natural",
+    "azucar%2c-edulcorantes-y-mieles",
+    "infusiones-y-tes",
+    "cafe-y-cacaos",
+    "legumbres-y-pastas",
+    "mermeladas%2c-cremas-y-pates",
+    "otros",
+    "reposteria%2c-galletas-y-panes",
+    "superalimentos%2c-raw-polvo",
+    "semillas-y-cereales",
+    "sin-gluten",
+    "sales%2c-aceites%2c-vinagres-y-salsas",
+    "aromaterapia",
+    "infantil-y-mama",
+    "vivir-sin-plastico",
+    "ofertas",
+    "chocolates",
+    "harinas",
+    "frutos-secos",
+    "tortitas-y-barritas",
+]
+
+LAURISILVA_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,*/*",
+    "Accept-Language": "es-ES,es;q=0.9",
+}
+
+LISTA_DESEOS_RE = re.compile(r"^lista_deseos-\d+$")
+
+
+def _php_object_hook(name, d):
+    return phpserialize.phpobject(name, d)
+
+
+def _to_dict(obj):
+    if hasattr(obj, "_asdict"):
+        return obj._asdict()
+    if hasattr(obj, "__dict__"):
+        return obj.__dict__
+    return obj if isinstance(obj, dict) else {}
+
+
+def _php_str(obj, key: str, default: str = "") -> str:
+    """Lee campo string de Articulo deserializado (claves bytes)."""
+    val = obj.get(key.encode()) if isinstance(obj, dict) else None
+    if val is None:
+        return default
+    if isinstance(val, bytes):
+        try:
+            return val.decode("utf-8", errors="replace")
+        except Exception:
+            return default
+    return str(val)
+
+
+def _php_num(obj, key: str, default: float = 0.0) -> float:
+    val = obj.get(key.encode()) if isinstance(obj, dict) else None
+    try:
+        return float(val) if val is not None else default
+    except Exception:
+        return default
+
+
+def parse_categoria_laurisilva(html: str) -> list[Producto]:
+    """Extrae productos de una página de categoría laurisilva."""
+    soup = BeautifulSoup(html, "lxml")
+    productos: list[Producto] = []
+
+    for div in soup.find_all("div", attrs={"data-update": LISTA_DESEOS_RE}):
+        config_b64 = div.get("data-configuration", "")
+        if not config_b64:
+            continue
+        try:
+            raw = base64.b64decode(config_b64)
+            outer = phpserialize.loads(raw, decode_strings=False, object_hook=_php_object_hook)
+            opciones = outer.get(b"opciones", {}) if isinstance(outer, dict) else {}
+            articulo = opciones.get(b"producto") if isinstance(opciones, dict) else None
+            if articulo is None:
+                continue
+            art = _to_dict(articulo)
+            if not art:
+                continue
+
+            nombre = _php_str(art, "nombre")
+            url = _php_str(art, "url")
+            if not nombre or not url:
+                continue
+
+            ean = _php_str(art, "ean")
+            sku = ean or _php_str(art, "referencia") or _php_str(art, "codigo")
+            precio_val = _php_num(art, "pvp_final") or _php_num(art, "pvp")
+            marca = _php_str(art, "autor")
+            obs_html = _php_str(art, "observaciones")
+            descripcion = BeautifulSoup(obs_html, "lxml").get_text(" ", strip=True)[:1000] if obs_html else ""
+            categoria = ""
+            temas = art.get(b"temas")
+            if isinstance(temas, dict) and temas:
+                first_tema = next(iter(temas.values()), None)
+                if first_tema is not None:
+                    categoria = _php_str(_to_dict(first_tema), "nombre")
+
+            productos.append(Producto(
+                nombre=nombre,
+                precio=f"{precio_val:.2f}",
+                marca=marca,
+                descripcion=descripcion,
+                categoria=categoria,
+                sku=str(sku),
+                url=url,
+                tienda="LauriSilvaBio",
+            ))
+        except Exception as e:
+            logger.debug(f"Error parsing widget: {e}")
+            continue
+
+    return productos
+
+
+def scrape_laurisilva_categorias(qdrant: QdrantClient, openai_client: OpenAI):
+    """Scrape laurisilva paginando categorías. Sin Playwright."""
+    collection = "laurisilva_productos"
+    ensure_collection(qdrant, collection)
+    existing_hashes = fetch_existing_hashes(qdrant, collection)
+
+    seen_uids: set[int] = set()
+    batch: list[Producto] = []
+    ok = skipped = err = pages = 0
+
+    for cat in LAURISILVA_CATEGORIAS:
+        page = 0
+        empty_streak = 0
+        while True:
+            url = f"https://www.laurisilvabio.com/{cat}" if page == 0 else f"https://www.laurisilvabio.com/{cat}-p{page}"
+            try:
+                r = requests.get(url, headers=LAURISILVA_HEADERS, timeout=30)
+                if r.status_code != 200:
+                    logger.warning(f"[{cat}] page {page} → HTTP {r.status_code}")
+                    break
+                productos = parse_categoria_laurisilva(r.text)
+            except Exception as e:
+                logger.warning(f"[{cat}] page {page} error: {e}")
+                err += 1
+                break
+
+            pages += 1
+            if not productos:
+                empty_streak += 1
+                if empty_streak >= 1:
+                    break
+            else:
+                empty_streak = 0
+
+            new_in_page = 0
+            for p in productos:
+                uid = p.uid()
+                if uid in seen_uids:
+                    continue
+                seen_uids.add(uid)
+                new_in_page += 1
+                if existing_hashes.get(uid) == p.content_hash():
+                    skipped += 1
+                else:
+                    batch.append(p)
+                    ok += 1
+
+            if len(batch) >= BATCH_SIZE:
+                upsert_batch(qdrant, collection, batch, openai_client)
+                logger.info(f"[laurisilva] cat={cat} page={page} upserted={ok} skipped={skipped} unique={len(seen_uids)}")
+                batch = []
+
+            if new_in_page == 0 and page > 0:
+                break
+
+            page += 1
+            time.sleep(SCRAPE_DELAY)
+
+    if batch:
+        upsert_batch(qdrant, collection, batch, openai_client)
+
+    logger.info(f"[laurisilva] COMPLETO — {ok} actualizados, {skipped} sin cambios, {err} errores, {pages} páginas, {len(seen_uids)} productos únicos")
 
 
 def get_product_urls_laurisilva(qdrant_client: QdrantClient = None) -> list[str]:
@@ -374,17 +571,15 @@ async def run_pipeline_async(tienda: str):
     openai_client = OpenAI(api_key=OPENAI_API_KEY)
     qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=10)
 
-    tasks = []
     if tienda in ("ventana_natural", "all"):
-        tasks.append(("ventana_natural_productos", lambda: get_product_urls_ventana_natural(), parse_ventana_natural))
-    if tienda in ("laurisilva", "all"):
-        tasks.append(("laurisilva_productos", lambda: get_product_urls_laurisilva(qdrant), parse_laurisilva))
+        ensure_collection(qdrant, "ventana_natural_productos")
+        urls = get_product_urls_ventana_natural()
+        logger.info(f"Procesando {len(urls)} URLs para ventana_natural_productos")
+        await scrape_urls_with_playwright(urls, parse_ventana_natural, "ventana_natural_productos", qdrant, openai_client)
 
-    for collection_name, get_urls_fn, parser_fn in tasks:
-        ensure_collection(qdrant, collection_name)
-        urls = get_urls_fn()
-        logger.info(f"Procesando {len(urls)} URLs para {collection_name}")
-        await scrape_urls_with_playwright(urls, parser_fn, collection_name, qdrant, openai_client)
+    if tienda in ("laurisilva", "all"):
+        logger.info("Iniciando scraping laurisilva por categorías (sin Playwright)")
+        scrape_laurisilva_categorias(qdrant, openai_client)
 
 
 def run_pipeline(tienda: str):

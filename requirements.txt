@@ -9,3 +9,4 @@ beautifulsoup4==4.12.3
 lxml==5.2.2
 playwright==1.44.0
 playwright-stealth==1.0.6
+phpserialize==1.3
