@@ -72,7 +72,11 @@ def get_urls_from_sitemap(sitemap_url: str, session: requests.Session) -> list[s
     try:
         r = session.get(sitemap_url, timeout=15)
         r.raise_for_status()
-        root = ET.fromstring(r.content)
+        content = r.content
+        if content[:1] != b"<":
+            logger.error(f"Sitemap {sitemap_url} no devolvió XML — posible bloqueo. Primeros 200 bytes: {content[:200]}")
+            return []
+        root = ET.fromstring(content)
         urls = [loc.text.strip() for loc in root.findall(".//sm:loc", SITEMAP_NS) if loc.text]
         logger.info(f"Sitemap {sitemap_url} → {len(urls)} URLs")
         return urls
@@ -81,17 +85,17 @@ def get_urls_from_sitemap(sitemap_url: str, session: requests.Session) -> list[s
         return []
 
 
-def get_product_urls_ventana_natural(session: requests.Session) -> list[str]:
+def get_product_urls_ventana_natural(sitemap_session: requests.Session) -> list[str]:
     """PrestaShop: filtra URLs de producto por patrón /categoria/id-nombre.html"""
     import re
-    all_urls = get_urls_from_sitemap("https://laventananatural.com/1_es_0_sitemap.xml", session)
+    all_urls = get_urls_from_sitemap("https://laventananatural.com/1_es_0_sitemap.xml", sitemap_session)
     product_pattern = re.compile(r"laventananatural\.com/[^/]+/\d+-[^/]+\.html$")
     products = [u for u in all_urls if product_pattern.search(u)]
     logger.info(f"La Ventana Natural — {len(products)} productos encontrados")
     return products
 
 
-def get_product_urls_laurisilva(session: requests.Session) -> list[str]:
+def get_product_urls_laurisilva(sitemap_session: requests.Session) -> list[str]:
     """Laurisilvabio: 4 sitemaps paginados de productos"""
     sitemaps = [
         "https://www.laurisilvabio.com/product_sitemap_0.xml",
@@ -101,7 +105,7 @@ def get_product_urls_laurisilva(session: requests.Session) -> list[str]:
     ]
     all_urls = []
     for sm in sitemaps:
-        all_urls.extend(get_urls_from_sitemap(sm, session))
+        all_urls.extend(get_urls_from_sitemap(sm, sitemap_session))
     logger.info(f"LauriSilvaBio — {len(all_urls)} productos encontrados")
     return all_urls
 
@@ -266,6 +270,15 @@ def run_pipeline(tienda: str):
     openai_client = OpenAI(api_key=OPENAI_API_KEY)
     qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=10)
 
+    # Sesión para sitemaps XML — headers mínimos, sin fingerprinting de navegador
+    sitemap_session = requests.Session()
+    sitemap_session.headers.update({
+        "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+        "Accept": "application/xml,text/xml,*/*",
+        "Accept-Language": "es-ES,es;q=0.9",
+    })
+
+    # Sesión para páginas de producto — simula navegador Chrome completo
     session = requests.Session()
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -306,7 +319,7 @@ def run_pipeline(tienda: str):
             pass
 
         ensure_collection(qdrant, collection_name)
-        urls = get_urls_fn(session)
+        urls = get_urls_fn(sitemap_session)
         logger.info(f"Procesando {len(urls)} URLs para {collection_name}")
 
         batch: list[Producto] = []
