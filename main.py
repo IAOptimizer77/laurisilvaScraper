@@ -18,7 +18,8 @@ warnings.filterwarnings("ignore", category=UserWarning, module="qdrant_client")
 # ============================================================
 
 APP_NAME = os.getenv("APP_NAME", "agente-laurisilva")
-QDRANT_URL = os.getenv("QDRANT_URL", "http://qdrant-db:6333") 
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook/retell_rag")
+QDRANT_URL = os.getenv("QDRANT_URL", "http://qdrant-db:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 QDRANT_COLLECTION_LAURISILVA    = os.getenv("QDRANT_COLLECTION_LAURISILVA", "laurisilva_productos")
 QDRANT_COLLECTION_VENTANA       = os.getenv("QDRANT_COLLECTION_VENTANA", "ventana_natural_productos")
@@ -160,7 +161,7 @@ async def process_rag(query: str, trace_id: str, tienda: str = "") -> Dict[str, 
 # 📍 Endpoints
 # ============================================================
 
-@app.post("/webhook/retell_rag")
+@app.post(WEBHOOK_PATH)
 async def webhook_rag(request: Request):
     tid = str(uuid.uuid4())[:8]
     try:
