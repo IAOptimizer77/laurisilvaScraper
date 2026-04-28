@@ -1,30 +1,20 @@
-name: Scrape herbolario stores
+name: Scrape laurisilvabio.com
 
 on:
   workflow_dispatch:
-    inputs:
-      tienda:
-        description: "Store to scrape (all, laurisilva, ventana_natural)"
-        required: false
-        default: "all"
   schedule:
-    # 02:00 UTC daily (~03:00-04:00 Atlantic/Canary)
-    - cron: "0 2 * * *"
+    - cron: "0 2 * * *"  # 02:00 UTC daily
 
 jobs:
-  scrape:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 60
+  laurisilva:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
-
       - name: Install Python dependencies
         run: |
           pip install --no-cache-dir \
@@ -37,14 +27,10 @@ jobs:
             phpserialize==1.3 \
             playwright==1.44.0 \
             playwright-stealth==1.0.6
-
-      - name: Install Playwright Chromium
-        run: playwright install --with-deps chromium
-
-      - name: Run scraper
+      - name: Run laurisilva scraper
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           QDRANT_API_KEY: ${{ secrets.QDRANT_API_KEY }}
           QDRANT_URL: ${{ secrets.QDRANT_URL }}
           SCRAPE_DELAY: "0.5"
-        run: python scraper.py ${{ github.event.inputs.tienda || 'all' }}
+        run: python scraper.py laurisilva
