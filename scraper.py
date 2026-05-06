@@ -366,40 +366,42 @@ def _get_urls_from_qdrant(client: QdrantClient, collection: str) -> list[str]:
 def parse_ventana_natural(html: str, url: str) -> Optional[Producto]:
     soup = BeautifulSoup(html, "lxml")
 
-    nombre_el = (
-        soup.select_one("h1.product_name, h1.page-heading, h1[itemprop='name']") or
-        soup.select_one("h1")
-    )
-    nombre = nombre_el.get_text(strip=True) if nombre_el else ""
-    if not nombre:
+    # Selector específico de la plantilla PrestaShop de laventananatural.
+    # Si no aparece → la página es challenge Cloudflare o homepage; no guardar basura.
+    nombre_el = soup.select_one("h1.productpage_title, h1[itemprop='name']")
+    if not nombre_el:
+        return None
+    nombre = nombre_el.get_text(strip=True)
+    if not nombre or nombre.strip().lower() == "la ventana natural":
         return None
 
-    precio_el = (
-        soup.select_one("span[itemprop='price'], span.current-price-value, .product-price") or
-        soup.select_one(".price")
+    precio_el = soup.select_one(
+        "[itemprop='price'], .current-price span, span.current-price-value, .product-price .price"
     )
     precio = precio_el.get_text(strip=True) if precio_el else ""
 
-    marca_el = (
-        soup.select_one("span[itemprop='brand'], .manufacturer-name, a.manufacturer") or
-        soup.select_one("[itemprop='brand']")
+    marca_el = soup.select_one(
+        "h2[itemprop='brand'], [itemprop='brand'], .brand-name, .manufacturer-name"
     )
     marca = marca_el.get_text(strip=True) if marca_el else ""
 
-    desc_el = (
-        soup.select_one("div[itemprop='description'], #short_description_block, .product-description") or
-        soup.select_one(".product_description")
+    desc_el = soup.select_one(
+        "[itemprop='description'], #product-description-short, .product-description, #short_description_block"
     )
     descripcion = desc_el.get_text(separator=" ", strip=True)[:1000] if desc_el else ""
 
-    breadcrumbs = soup.select("nav[aria-label='breadcrumb'] li, ol.breadcrumb li, .breadcrumb li")
+    breadcrumbs = soup.select(
+        "nav[aria-label='breadcrumb'] [itemprop='name'], ol.breadcrumb [itemprop='name'], .breadcrumb li"
+    )
     categoria = " > ".join(b.get_text(strip=True) for b in breadcrumbs[1:-1]) if len(breadcrumbs) > 2 else ""
 
-    sku_el = soup.select_one("[itemprop='sku'], .product-reference span")
-    sku = sku_el.get_text(strip=True) if sku_el else url.split("-")[-1].replace(".html", "")
+    sku_el = soup.select_one("[itemprop='sku'], .product-reference span, .product-reference")
+    sku = sku_el.get_text(strip=True) if sku_el else url.rsplit("-", 1)[-1].replace(".html", "")
 
-    return Producto(nombre=nombre, precio=precio, marca=marca, descripcion=descripcion,
-                    categoria=categoria, sku=sku, url=url, tienda="La Ventana Natural")
+    return Producto(
+        nombre=nombre, precio=precio, marca=marca, descripcion=descripcion,
+        categoria=categoria, sku=sku, url=url, tienda="La Ventana Natural"
+    )
 
 
 def parse_laurisilva(html: str, url: str) -> Optional[Producto]:
